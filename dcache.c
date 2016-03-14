@@ -79,10 +79,15 @@ struct file_header {
     u_int                           max_blocks;
 } __attribute__ ((packed));
 
-/* One directory entry */
+/* One directory entry
+ * c_dir_dirty用来标示数据是否写入目录区，1：dirty，0：clean
+ * 数据在写入缓存data区成功后即可写入目录区，并加入dirty队列，然后写入s3_storage
+ * 状态为1的数据加入dirty队列，状态为0的数据加入clean队列
+ */
 struct dir_entry {
     s3b_block_t                     block_num;
     u_char                          md5[MD5_DIGEST_LENGTH];
+    u_int                           c_dir_dirty;
 } __attribute__ ((packed));
 
 /* Private structure */
@@ -91,8 +96,8 @@ struct s3b_dcache {
     log_func_t                      *log;
     char                            *filename;
     void                            *zero_block;
-    u_int                           block_size;
-    u_int                           max_blocks;
+    u_int                           block_size;   //块大小，单位为byte，例：1M=1048576 byte
+    u_int                           max_blocks;  //块缓存个数，blockCacheSize
     u_int                           num_alloc;
     off_t                           data;
     u_int                           free_list_len;
@@ -312,7 +317,7 @@ s3b_dcache_alloc_block(struct s3b_dcache *priv, u_int *dslotp)
  * There MUST NOT be a directory entry for the block.
  */
 int
-s3b_dcache_record_block(struct s3b_dcache *priv, u_int dslot, s3b_block_t block_num, const u_char *md5)
+s3b_dcache_record_block(struct s3b_dcache *priv, u_int dslot, s3b_block_t block_num, const u_char *md5, u_int flag)
 {
     struct dir_entry entry;
     int r;
@@ -328,6 +333,7 @@ s3b_dcache_record_block(struct s3b_dcache *priv, u_int dslot, s3b_block_t block_
         return r;
 
     /* Update directory */
+    entry.c_dir_dirty = flag;
     entry.block_num = block_num;
     memcpy(&entry.md5, md5, MD5_DIGEST_LENGTH);
     if ((r = s3b_dcache_write_entry(priv, dslot, &entry)) != 0)
@@ -335,6 +341,24 @@ s3b_dcache_record_block(struct s3b_dcache *priv, u_int dslot, s3b_block_t block_
 
     /* Done */
     return 0;
+}
+
+/*
+ * Update a block's dslot in the directory.
+ */
+int s3b_dcache_update_directory(struct s3b_dcache *priv, u_int dslot, s3b_block_t block_num, const u_char *md5, u_int flag)
+{
+	struct dir_entry entry;
+	int r;
+	/* Update directory */
+	entry.c_dir_dirty = flag;
+	entry.block_num = block_num;
+	memcpy(&entry.md5, md5, MD5_DIGEST_LENGTH);
+	if ((r = s3b_dcache_write_entry(priv, dslot, &entry)) != 0)
+		return r;
+
+	/* Done */
+	return 0;
 }
 
 /*
@@ -658,30 +682,30 @@ s3b_dcache_init_free_list(struct s3b_dcache *priv, s3b_dcache_visit_t *visitor, 
     (*priv->log)(LOG_INFO, "reading meta-data from cache file `%s'", priv->filename);
 
     /* Inspect all directory entries */
+    //循环读取所有dir_entry，每次最多读取1024个dir_entry
     for (num_dslots_used = base_dslot = 0; base_dslot < priv->max_blocks; base_dslot += num_entries) {
         struct dir_entry entries[DIRECTORY_READ_CHUNK];
 
         /* Read in the next chunk of directory entries */
         num_entries = priv->max_blocks - base_dslot;
         if (num_entries > DIRECTORY_READ_CHUNK)
-            num_entries = DIRECTORY_READ_CHUNK;
+            num_entries = DIRECTORY_READ_CHUNK;  //num_entries:当前读取的dir_entry数目（不大于1024）
         if ((r = s3b_dcache_read(priv, DIR_OFFSET(base_dslot), entries, num_entries * sizeof(*entries))) != 0) {
             (*priv->log)(LOG_ERR, "error reading cache file `%s' directory: %s", priv->filename, strerror(r));
             return r;
         }
 
         /* For each dslot: if free, add to the free list, else notify visitor */
-        for (i = 0; i < num_entries; i++) {
+        for (i = 0; i < num_entries; i++) {   //遍历已读取的所有dir_entry
             const struct dir_entry *const entry = &entries[i];
             const u_int dslot = base_dslot + i;
-
             if (memcmp(entry, &zero_entry, sizeof(*entry)) == 0) {
                 if ((r = s3b_dcache_push(priv, dslot)) != 0)
                     return r;
             } else {
                 if (dslot + 1 > num_dslots_used)                    /* keep track of the number of dslots in use */
                     num_dslots_used = dslot + 1;
-                if (visitor != NULL && (r = (*visitor)(arg, dslot, entry->block_num, entry->md5)) != 0)
+                if (visitor != NULL && (r = (*visitor)(arg, dslot, entry->block_num, entry->md5, entry->c_dir_dirty)) != 0)
                     return r;
             }
         }
@@ -823,7 +847,7 @@ s3b_dcache_write2(struct s3b_dcache *priv, int fd, const char *filename, off_t o
 {
     size_t sofar;
     ssize_t r;
-
+  //  (*priv->log)(LOG_INFO, "s3b_dcache_write2----filename >> `%s' at offset %ju: %u", filename, offset, len);
     for (sofar = 0; sofar < len; sofar += r) {
         const off_t posn = offset + sofar;
 
