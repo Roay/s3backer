@@ -344,7 +344,7 @@ s3b_dcache_record_block(struct s3b_dcache *priv, u_int dslot, s3b_block_t block_
 }
 
 /*
- * Update a block's dslot in the directory.
+ * Update a block's dslot in the directory. Avoid fsync.
  */
 int s3b_dcache_update_directory(struct s3b_dcache *priv, u_int dslot, s3b_block_t block_num, const u_char *md5, u_int flag)
 {

@@ -477,6 +477,7 @@ static int fuse_op_write(const char *path, const char *buf, size_t size,
         if (fraglen > size)
             fraglen = size;
         block_num = offset >> priv->block_bits;
+  //      (*config->log)(LOG_DEBUG, "111 >>>>>>>>> offset=0x%jx size=0x%jx", (uintmax_t)offset, (uintmax_t)size);
         if ((r = (*priv->s3b->write_block_part)(priv->s3b, block_num, fragoff, fraglen, buf)) != 0)
             return -r;
         buf += fraglen;
@@ -490,6 +491,7 @@ static int fuse_op_write(const char *path, const char *buf, size_t size,
 
     /* Write intermediate complete blocks */
     while (num_blocks-- > 0) {
+  //  	(*config->log)(LOG_DEBUG, "222 >>>>>>>>> offset=0x%jx size=0x%jx", (uintmax_t)offset, (uintmax_t)size);
         if ((r = (*priv->s3b->write_block)(priv->s3b, block_num++, buf, NULL, NULL, NULL)) != 0)
             return -r;
         buf += config->block_size;
@@ -498,7 +500,7 @@ static int fuse_op_write(const char *path, const char *buf, size_t size,
     /* Write last block fragment (if any) */
     if ((size & mask) != 0) {
         const size_t fraglen = size & mask;
-
+   //     (*config->log)(LOG_DEBUG, "333 >>>>>>>>> offset=0x%jx size=0x%jx", (uintmax_t)offset, (uintmax_t)size);
         if ((r = (*priv->s3b->write_block_part)(priv->s3b, block_num, 0, fraglen, buf)) != 0)
             return -r;
     }

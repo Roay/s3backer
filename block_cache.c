@@ -777,7 +777,7 @@ block_cache_write(struct block_cache_private *const priv, s3b_block_t block_num,
 
     /* Grab lock */
     pthread_mutex_lock(&priv->mutex);
-
+//    (*config->log)(LOG_DEBUG, "111>>>>>>>> %u >>>>offset=0x%jx size=0x%jx",block_num,(uintmax_t)off, (uintmax_t)len);
 again:
     /* Sanity check */
     S3BCACHE_CHECK_INVARIANTS(priv);
@@ -825,7 +825,7 @@ again:
             priv->stats.write_hits++;
             /* 写完data区之后，写入dir_entry，状态为dirty，md5为0*/
             if (config->cache_file != NULL) {
-                if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, ini_md5, DIRE_ENTRY_DIRTY)) != 0)
+                if ((r = s3b_dcache_update_directory(priv->dcache, entry->u.dslot, entry->block_num, ini_md5, DIRE_ENTRY_DIRTY)) != 0)
                     (*config->log)(LOG_ERR, "can't record cached block! %s", strerror(r));
  //           	(*config->log)(LOG_DEBUG, "block_num in hash>>>>>>>>>>block_num= %u", entry->block_num);
             }
@@ -882,7 +882,7 @@ again:
 	/* 写完data区之后，写入dir_entry，状态为dirty，md5为0，经测试，当缓存数据已满，删除缓存数据（删除的数据不完全在缓存中）时会触发*/
 	if (config->cache_file != NULL) {
 	//	(*config->log)(LOG_DEBUG, "block_num does not in hash>>>>>>>>>>block_num= %u", entry->block_num);
-		if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, ini_md5, DIRE_ENTRY_DIRTY)) != 0)
+		if ((r = s3b_dcache_update_directory(priv->dcache, entry->u.dslot, entry->block_num, ini_md5, DIRE_ENTRY_DIRTY)) != 0)
 			(*config->log)(LOG_ERR, "can't record cached block! %s", strerror(r));
 	}
     /* Wake up a worker thread to go write it */
@@ -917,6 +917,7 @@ success:
 
 fail:
     /* Done */
+//    (*config->log)(LOG_DEBUG, "222>>>>>>>> %u >>>>offset=0x%jx size=0x%jx",block_num,(uintmax_t)off, (uintmax_t)len);
     pthread_mutex_unlock(&priv->mutex);
     return r;
 }
@@ -1120,7 +1121,7 @@ block_cache_worker_main(void *arg)
             /* If block was not modified while being written (WRITING), it is now CLEAN */
             if (!entry->dirty) {
                 if (config->cache_file != NULL) {
-                    if ((r = s3b_dcache_update_directory(priv->dcache, entry->u.dslot, entry->block_num, md5, DIRE_ENTRY_CLEAN)) != 0)
+                    if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, md5, DIRE_ENTRY_CLEAN)) != 0)
                         (*config->log)(LOG_ERR, "can't record cached block! %s", strerror(r));
                 }
                 priv->num_dirties--;
