@@ -38,6 +38,7 @@ bin_PROGRAMS=       s3backer
 noinst_PROGRAMS=    tester
 
 noinst_HEADERS=     s3backer.h \
+			mem_cache.h \
 			block_cache.h \
 			block_part.h \
 			dcache.h \
@@ -59,6 +60,7 @@ doc_DATA=           CHANGES COPYING README INSTALL TODO
 EXTRA_DIST=         CHANGES s3backer.1 s3backer.spec
 
 s3backer_SOURCES=   main.c \
+			mem_cache.c \
 		    block_cache.c \
 		    block_part.c \
 		    dcache.c \
@@ -73,6 +75,7 @@ s3backer_SOURCES=   main.c \
 		    gitrev.c
 
 tester_SOURCES=     tester.c \
+			mem_cache.c \
 		    block_cache.c \
 		    block_part.c \
 		    dcache.c \
