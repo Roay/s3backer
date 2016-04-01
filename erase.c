@@ -35,6 +35,7 @@
  */
 
 #include "s3backer.h"
+#include "mem_cache.h"
 #include "block_cache.h"
 #include "ec_protect.h"
 #include "fuse_ops.h"

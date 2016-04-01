@@ -35,6 +35,7 @@
  */
 
 #include "s3backer.h"
+#include "mem_cache.h"
 #include "block_cache.h"
 #include "ec_protect.h"
 #include "fuse_ops.h"
@@ -81,6 +82,11 @@
 #define S3BACKER_DEFAULT_READ_AHEAD_TRIGGER         2
 #define S3BACKER_DEFAULT_COMPRESSION                Z_NO_COMPRESSION
 #define S3BACKER_DEFAULT_ENCRYPTION                 "AES-128-CBC"
+
+#define S3BACKER_DEFAULT_MEM_TIMEOUT                100             // 100ms
+#define S3BACKER_DEFAULT_MEM_MAX_THREADS            4
+#define S3BACKER_DEFAULT_MIN_BLOCK_SIZE             4096            // 4k
+#define S3BACKER_DEFAULT_MEM_BLOCK_SIZE             4096            // 4k
 
 /* MacFUSE setting for kernel daemon timeout */
 #ifdef __APPLE__
@@ -176,6 +182,15 @@ static struct s3b_config config = {
         .read_ahead=            S3BACKER_DEFAULT_READ_AHEAD,
         .read_ahead_trigger=    S3BACKER_DEFAULT_READ_AHEAD_TRIGGER,
     },
+
+	/* Memory cache config */
+	.mem_cache= {
+		.min_block_size=        S3BACKER_DEFAULT_MIN_BLOCK_SIZE,
+		.mem_max_threads=       S3BACKER_DEFAULT_MEM_MAX_THREADS,
+		.mem_timeout=           S3BACKER_DEFAULT_MEM_TIMEOUT,
+		.mem_block_size=        S3BACKER_DEFAULT_MEM_BLOCK_SIZE,
+		.min_max_dirty=         1,
+	},
 
     /* FUSE operations config */
     .fuse_ops= {
@@ -440,6 +455,31 @@ static const struct fuse_opt option_list[] = {
         .offset=    offsetof(struct s3b_config, fuse_ops.direct_io),
         .value=     1
     },
+    {
+        .templ=     "--mem_cache_flag",
+        .offset=    offsetof(struct s3b_config, mem_cache_flag),
+        .value=     1
+    },
+	{
+        .templ=     "--min_max_dirty=%u",
+        .offset=    offsetof(struct s3b_config, mem_cache.min_max_dirty),
+    },
+	{
+        .templ=     "--min_block_size=%s",
+        .offset=    offsetof(struct s3b_config, min_block_size_str),
+    },
+	{
+        .templ=     "--mem_block_size=%s",
+        .offset=    offsetof(struct s3b_config, mem_block_size_str),
+    },
+	{
+        .templ=     "--mem_max_threads=%u",
+        .offset=    offsetof(struct s3b_config, mem_cache.mem_max_threads),
+    },
+	{
+        .templ=     "--mem_timeout=%u",
+        .offset=    offsetof(struct s3b_config, mem_cache.mem_timeout),
+    },
 };
 
 /* Default flags we send to FUSE */
@@ -504,6 +544,7 @@ static const struct size_suffix size_suffixes[] = {
 };
 
 /* s3backer_store layers */
+struct s3backer_store *mem_cache_store;
 struct s3backer_store *block_cache_store;
 struct s3backer_store *ec_protect_store;
 struct s3backer_store *http_io_store;
@@ -612,6 +653,12 @@ s3backer_create_store(struct s3b_config *conf)
         if ((block_cache_store = block_cache_create(&conf->block_cache, store)) == NULL)
             goto fail_with_errno;
         store = block_cache_store;
+        /* Create memory cache layer (if desired) */
+    	if (conf->mem_cache_flag) {
+    		if ((mem_cache_store = mem_cache_create(&conf->mem_cache, store)) == NULL)
+    			goto fail_with_errno;
+    		store = mem_cache_store;
+    	}
     }
 
     /* Set mounted flag and check previous value one last time */
@@ -636,6 +683,7 @@ fail_with_errno:
 fail:
     if (store != NULL)
         (*store->destroy)(store);
+    mem_cache_store = NULL;
     block_cache_store = NULL;
     ec_protect_store = NULL;
     http_io_store = NULL;
@@ -1190,6 +1238,21 @@ validate_config(void)
         }
         config.file_size = value;
     }
+    /* Parse min_block and mem_block sizes */
+	if (config.min_block_size_str != NULL) {
+		if (parse_size_string(config.min_block_size_str, &value) == -1 || value == 0) {
+			warnx("invalid min_block size `%s'", config.min_block_size_str);
+			return -1;
+		}
+		config.mem_cache.min_block_size = value;
+	}
+    if (config.mem_block_size_str != NULL) {
+		if (parse_size_string(config.mem_block_size_str, &value) == -1 || value == 0) {
+			warnx("invalid mem_block size `%s'", config.mem_block_size_str);
+			return -1;
+		}
+		config.mem_cache.mem_block_size = value;
+	}
 
     /* Parse upload/download speeds */
     for (i = 0; i < 2; i++) {
@@ -1402,6 +1465,39 @@ validate_config(void)
           (uintmax_t)config.block_cache.cache_size, (uintmax_t)config.num_blocks);
         config.block_cache.cache_size = config.num_blocks;
     }
+    if (config.mem_cache_flag) {
+		/* Check mem_block_size and min_block_size */
+		if (config.mem_cache.mem_block_size < config.block_size) {
+			warnx("mem_block_size (%u) less than block_size (%u); automatically increase",
+					config.mem_cache.mem_block_size, config.block_size);
+			//config.mem_cache.mem_block_size = config.block_size;
+			return -1;
+		}
+		if (config.mem_cache.min_block_size != (1 << (ffs(config.mem_cache.min_block_size) - 1))) {
+			warnx("min_block size must be a power of 2");
+			return -1;
+		}
+		if (config.mem_cache.mem_block_size != (1 << (ffs(config.mem_cache.mem_block_size) - 1))) {
+			warnx("mem_block size must be a power of 2");
+			return -1;
+		}
+		if (config.mem_cache.mem_block_size < config.mem_cache.min_block_size) {
+			warnx("mem_block size can not be less than min_block size");
+			return -1;
+		}
+		if (config.mem_cache.mem_block_size % config.block_size != 0) {
+			warnx("memory cache block_size must be a multiple of block size");
+			return -1;
+		}
+
+		/* Check min_max_dirty */
+		config.mem_cache.min_num_blocks = config.mem_cache.mem_block_size / config.mem_cache.min_block_size;
+		if (config.mem_cache.min_num_blocks < config.mem_cache.min_max_dirty) {
+			warnx("min_max_dirty (%u) is greater that the total number of min_blocks in one mem_block (%u); automatically reducing",
+					config.mem_cache.min_max_dirty, config.mem_cache.min_num_blocks);
+			config.mem_cache.min_max_dirty = config.mem_cache.min_num_blocks;
+		}
+    }
 
 #ifdef __APPLE__
     /* On MacOS, warn if kernel timeouts can happen prior to our own timeout */
@@ -1436,6 +1532,9 @@ validate_config(void)
 #endif  /* __APPLE__ */
 
     /* Copy common stuff into sub-module configs */
+    config.mem_cache.log = config.log;
+    config.mem_cache.block_size = config.block_size;
+    config.mem_cache.cache_size = config.block_cache.cache_size;
     config.block_cache.block_size = config.block_size;
     config.block_cache.log = config.log;
     config.http_io.debug = config.debug;
@@ -1566,6 +1665,14 @@ dump_config(void)
     (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "block_cache_cache_file",
       config.block_cache.cache_file != NULL ? config.block_cache.cache_file : "");
     (*config.log)(LOG_DEBUG, "%24s: %s", "block_cache_no_verify", config.block_cache.no_verify ? "true" : "false");
+    (*config.log)(LOG_DEBUG, "%24s: %s", "mem_cache_flag", config.mem_cache_flag ? "true" : "false");
+    (*config.log)(LOG_DEBUG, "%24s: %s (%u)", "mem_block_size",
+      config.mem_block_size_str != NULL ? config.mem_block_size_str : "-", (intmax_t)config.mem_cache.mem_block_size);
+    (*config.log)(LOG_DEBUG, "%24s: %s (%jd)", "min_block_size",
+      config.min_block_size_str != NULL ? config.min_block_size_str : "-", config.mem_cache.min_block_size);
+    (*config.log)(LOG_DEBUG, "%24s: %u threads", "mem_max_threads", config.mem_cache.mem_max_threads);
+    (*config.log)(LOG_DEBUG, "%24s: %u blocks", "min_max_dirty", config.mem_cache.min_max_dirty);
+    (*config.log)(LOG_DEBUG, "%24s: %ums", "mem_timeout", config.mem_cache.mem_timeout);
     (*config.log)(LOG_DEBUG, "fuse_main arguments:");
     for (i = 0; i < config.fuse_args.argc; i++)
         (*config.log)(LOG_DEBUG, "  [%d] = \"%s\"", i, config.fuse_args.argv[i]);
@@ -1686,6 +1793,12 @@ usage(void)
     fprintf(stderr, "\t--%-27s %s\n", "maxUploadSpeed=BITSPERSEC", "Max upload bandwidth for a single write");
     fprintf(stderr, "\t--%-27s %s\n", "md5CacheSize=NUM", "Max size of MD5 cache (zero = disabled)");
     fprintf(stderr, "\t--%-27s %s\n", "md5CacheTime=MILLIS", "Expire time for MD5 cache (zero = infinite)");
+	fprintf(stderr, "\t--%-27s %s\n", "mem_block_size=SIZE", "Memory cache block size, a multiple of block size (with optional suffix 'K', 'M'etc.)");
+    fprintf(stderr, "\t--%-27s %s\n", "mem_cache_flag", "Add memory cache layer");
+    fprintf(stderr, "\t--%-27s %s\n", "mem_max_threads=NUM", "Memory cache write-back thread pool size");
+    fprintf(stderr, "\t--%-27s %s\n", "mem_timeout=MILLIS", "Expire time for memory cache");
+    fprintf(stderr, "\t--%-27s %s\n", "min_block_size=SIZE", "File system block size (with optional suffix 'K', 'M' etc.)");
+    fprintf(stderr, "\t--%-27s %s\n", "min_max_dirty=NUM", "Memory cache maximum number of dirty blocks");
     fprintf(stderr, "\t--%-27s %s\n", "minWriteDelay=MILLIS", "Minimum time between same block writes");
     fprintf(stderr, "\t--%-27s %s\n", "password=PASSWORD", "Encrypt using PASSWORD");
     fprintf(stderr, "\t--%-27s %s\n", "passwordFile=FILE", "Encrypt using password read from FILE");

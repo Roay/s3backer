@@ -580,7 +580,7 @@ block_cache_do_read(struct block_cache_private *const priv, s3b_block_t block_nu
     assert(off <= priv->config->block_size);
     assert(len <= priv->config->block_size);
     assert(off + len <= priv->config->block_size);
-
+    (*config->log)(LOG_ERR, ">>>>>> %u", block_num);
 again:
     /* Check to see if a cache entry already exists */
     if ((entry = s3b_hash_get(priv->hashtable, block_num)) != NULL) {

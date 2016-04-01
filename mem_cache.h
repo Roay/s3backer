@@ -34,45 +34,20 @@
  * also delete it here.
  */
 
-#include "s3backer.h"
-#include "mem_cache.h"
-#include "block_cache.h"
-#include "ec_protect.h"
-#include "fuse_ops.h"
-#include "http_io.h"
-#include "s3b_config.h"
-#include "erase.h"
-#include "reset.h"
+/* Configuration info structure for mem_cache */
+struct mem_cache_conf {
+    u_int               block_size;
+    u_int               cache_size;
+	u_int               min_max_dirty;    // min_block max dirties
+    u_int               min_block_size;   // min_block size
+    u_int               mem_block_size;   // mem_block size
+    u_int               min_num_blocks;   // number of min_blocks
+    u_int               mem_max_threads;
+    u_int               mem_timeout;
+    log_func_t          *log;
+};
 
-int
-main(int argc, char **argv)
-{
-    const struct fuse_operations *fuse_ops;
-    struct s3b_config *config;
+/* mem_cache.c */
+extern struct s3backer_store *mem_cache_create(struct mem_cache_conf *config, struct s3backer_store *inner);
 
-    /* Get configuration */
-    if ((config = s3backer_get_config(argc, argv)) == NULL)
-        return 1;
-
-    /* Handle `--erase' flag */
-    if (config->erase) {
-        if (s3backer_erase(config) != 0)
-            return 1;
-        return 0;
-    }
-
-    /* Handle `--reset' flag */
-    if (config->reset) {
-        if (s3backer_reset(config) != 0)
-            return 1;
-        return 0;
-    }
-
-    /* Get FUSE operation hooks */
-    fuse_ops = fuse_ops_create(&config->fuse_ops);
-
-    /* Start */
-    (*config->log)(LOG_INFO, "s3backer process %lu for %s started", (u_long)getpid(), config->mount);
-    return fuse_main(config->fuse_args.argc, config->fuse_args.argv, fuse_ops, NULL);
-}
 

@@ -38,6 +38,7 @@
 struct s3b_config {
 
     /* Various sub-module configurations */
+	struct mem_cache_conf       mem_cache;
     struct block_cache_conf     block_cache;
     struct fuse_ops_conf        fuse_ops;
     struct ec_protect_conf      ec_protect;
@@ -50,6 +51,7 @@ struct s3b_config {
     u_int                       block_size;
     off_t                       file_size;
     off_t                       num_blocks;
+    int                         mem_cache_flag;
     int                         debug;
     int                         erase;
     int                         reset;
@@ -65,6 +67,8 @@ struct s3b_config {
     /* These are only used during command line parsing */
     const char                  *file_size_str;
     const char                  *block_size_str;
+    const char                  *min_block_size_str;
+    const char                  *mem_block_size_str;
     const char                  *password_file;
     const char                  *max_speed_str[2];
     int                         encrypt;
