@@ -65,10 +65,10 @@ struct min_block {
 struct mem_entry {
 	s3b_block_t            block_num;      // block number
 	u_int                  state;          // 0:CLEAN 1:DIRTY 2:READING 3:WRITING
-	struct min_block       *array_min[1];  // array of min_block
+	struct min_block       (*array_min)[0];  // array of min_block
     TAILQ_ENTRY(mem_entry) link;           // next in list (cleans or dirties)
     u_int                  num_dirties;    // min_block's number that are dirty
-    u_int64_t              update_time;    // last update time
+    uint64_t               update_time;    // last update time
     u_char                 *buf;           // buffer in memroy
     pthread_mutex_t        mem_mutex;      // my mutex
 };
@@ -77,7 +77,7 @@ struct mem_entry {
 #define ENTRY_IN_LIST(entry)                ((entry)->link.tqe_prev != NULL)
 #define ENTRY_RESET_LINK(entry)             do { (entry)->link.tqe_prev = NULL; } while (0)
 #define ENTRY_GET_STATE(entry)              ((entry)->state == 0 ?                       \
-		                                         CLEAN : ((entry)->state == 1 ?           \
+		                                         CLEAN : ((entry)->state == 1 ?          \
 		                                         DIRTY : ((entry)->state == 2 ? READING : WRITING)))
 
 /* One time unit in milliseconds */
@@ -96,11 +96,11 @@ struct mem_cache_private {
     struct s3b_hash                 *hashtable;     // hashtable of all cached blocks
     int                             stopping;       // signals worker threads to exit
     pthread_mutex_t                 pri_mutex;      // my mutex
-    pthread_cond_t                  space_avail;    // there is new space available in cache
-    pthread_cond_t                  write_complete; // a write has completed
-    pthread_cond_t                  end_reading;    // some entry in state READING changed state
-    pthread_cond_t                  worker_work;    // there is new work for worker thread(s)
-    pthread_cond_t                  worker_exit;    // a worker thread has exited
+    pthread_cond_t                  pri_worker_work;    // there is new work for worker thread(s)
+    pthread_cond_t                  pri_worker_exit;    // a worker thread has exited
+    pthread_cond_t                  pri_end_reading;    // some entry in state READING[2] changed state
+    pthread_cond_t                  pri_write_complete; // a write has completed
+    pthread_cond_t                  pri_space_avail;    // there is new space available in memory
 };
 
 /* Callback info */
@@ -128,6 +128,13 @@ static int mem_cache_read(struct mem_cache_private *priv, s3b_block_t block_num,
 static int mem_cache_write(struct mem_cache_private *priv, s3b_block_t block_num, u_int off, u_int len, const void *src);
 static void *mem_cache_worker_main(void *arg);
 static void mem_cache_free_one(void *arg, void *value);
+static int get_mem_cache_data(struct mem_cache_private *priv, struct mem_entry *entry, const void *src, u_int off, u_int len);
+static uint64_t mem_cache_get_time_millis(void);
+static uint32_t mem_cache_get_time(struct mem_cache_private *priv);
+static void mem_cache_worker_wait(struct mem_cache_private *priv, struct mem_entry *entry);
+static int mem_cache_get_entry(struct mem_cache_private *priv, struct mem_entry **entryp);
+static int mem_cache_read_inner(struct mem_cache_private *priv, s3b_block_t block_num,struct mem_entry *entry);
+static double mem_cache_dirty_ratio(struct mem_cache_private *priv, struct mem_entry *entry);
 
 /* Invariants checking */
 #ifndef NDEBUG
@@ -152,7 +159,7 @@ mem_cache_create(struct mem_cache_conf *config, struct s3backer_store *inner)
     struct mem_entry *entry;
     pthread_t thread;
     int r;
-    int hash_length;
+    u_int hash_length;
 
     /* Initialize s3backer_store structure */
     if ((s3b = calloc(1, sizeof(*s3b))) == NULL) {
@@ -187,21 +194,21 @@ mem_cache_create(struct mem_cache_conf *config, struct s3backer_store *inner)
 
     if ((r = pthread_mutex_init(&priv->pri_mutex, NULL)) != 0)
         goto fail2;
-    if ((r = pthread_cond_init(&priv->space_avail, NULL)) != 0)
+	if ((r = pthread_cond_init(&priv->pri_worker_work, NULL)) != 0)
 		goto fail3;
-	if ((r = pthread_cond_init(&priv->end_reading, NULL)) != 0)
+	if ((r = pthread_cond_init(&priv->pri_worker_exit, NULL)) != 0)
 		goto fail4;
-	if ((r = pthread_cond_init(&priv->worker_work, NULL)) != 0)
-		goto fail5;
-	if ((r = pthread_cond_init(&priv->worker_exit, NULL)) != 0)
-		goto fail6;
-	if ((r = pthread_cond_init(&priv->write_complete, NULL)) != 0)
+    if ((r = pthread_cond_init(&priv->pri_end_reading, NULL)) != 0)
+        goto fail5;
+    if ((r = pthread_cond_init(&priv->pri_write_complete, NULL)) != 0)
+        goto fail6;
+	if ((r = pthread_cond_init(&priv->pri_space_avail, NULL)) != 0)
 		goto fail7;
     TAILQ_INIT(&priv->queue);
 
     /* Create hash table */
-    int cacheSize = config->block_size * config->cache_size;
-    hash_length = ceil(cacheSize /  config->mem_block_size);
+    u_int multiple = config->mem_block_size / config->block_size;
+	hash_length = ceil((double)config->cache_size / multiple);
     if ((r = s3b_hash_create(&priv->hashtable, hash_length)) != 0)
         goto fail8;
     s3b->data = priv;
@@ -219,8 +226,8 @@ mem_cache_create(struct mem_cache_conf *config, struct s3backer_store *inner)
 fail9:
     priv->stopping = 1;
     while (priv->num_threads > 0) {
-        pthread_cond_broadcast(&priv->worker_work);
-        pthread_cond_wait(&priv->worker_exit, &priv->pri_mutex);
+        pthread_cond_broadcast(&priv->pri_worker_work);
+        pthread_cond_wait(&priv->pri_worker_exit, &priv->pri_mutex);
     }
 	while ((entry = TAILQ_FIRST(&priv->queue)) != NULL) {
 		TAILQ_REMOVE(&priv->queue, entry, link);
@@ -228,15 +235,15 @@ fail9:
 	}
     s3b_hash_destroy(priv->hashtable);
 fail8:
-    pthread_cond_destroy(&priv->write_complete);
+	pthread_cond_destroy(&priv->pri_space_avail);
 fail7:
-    pthread_cond_destroy(&priv->worker_exit);
+	pthread_cond_destroy(&priv->pri_write_complete);
 fail6:
-    pthread_cond_destroy(&priv->worker_work);
+	pthread_cond_destroy(&priv->pri_end_reading);
 fail5:
-    pthread_cond_destroy(&priv->end_reading);
+    pthread_cond_destroy(&priv->pri_worker_exit);
 fail4:
-    pthread_cond_destroy(&priv->space_avail);
+    pthread_cond_destroy(&priv->pri_worker_work);
 fail3:
     pthread_mutex_destroy(&priv->pri_mutex);
 fail2:
@@ -258,14 +265,89 @@ mem_cache_worker_main(void *arg)
 	struct mem_cache_private *const priv = arg;
 	struct mem_cache_conf *const config = priv->config;
 	struct mem_entry *entry;
+    u_int multiple = config->mem_block_size / config->block_size;
+    u_int cache_block_num;
+    uint64_t time_slot;
+    void *buf;
+    int r;
+    int i;
+    int flag = 0;
 
-	pthread_mutex_lock(&priv->pri_mutex);
-	pthread_cond_signal(&priv->space_avail);
-	pthread_cond_signal(&priv->worker_work);
-	pthread_cond_signal(&priv->worker_exit);
-	(*config->log)(LOG_DEBUG, ".....................");
-	pthread_mutex_unlock(&priv->pri_mutex);
-	return NULL;
+    /* Grab lock */
+    pthread_mutex_lock(&priv->pri_mutex);
+
+    if ((buf = malloc(config->block_size)) == NULL) {
+		(*config->log)(LOG_ERR, "Can't allocate buffer, exiting: %s", strerror(errno));
+		goto done;
+	}
+    while (1) {
+//    	(*config->log)(LOG_DEBUG, "..................................");
+        if ((entry = TAILQ_FIRST(&priv->queue)) != NULL) {
+        	time_slot = mem_cache_get_time_millis() - entry->update_time;
+        	if (ENTRY_GET_STATE(entry) == READING) {
+        		TAILQ_REMOVE(&priv->queue, entry, link);
+        		TAILQ_INSERT_TAIL(&priv->queue, entry, link);
+        		continue;
+			}
+//			(*config->log)(LOG_DEBUG, "time = %u   timeout = %u",time_slot/TIME_UNIT_MILLIS,config->mem_timeout);
+			if (mem_cache_dirty_ratio(priv, entry) > priv->max_dirty_ratio || time_slot/TIME_UNIT_MILLIS >= config->mem_timeout || priv->stopping) {
+//				(*config->log)(LOG_DEBUG, ">>>>>>>>>>%u",entry->block_num);
+				if (ENTRY_GET_STATE(entry) == CLEAN) {
+					TAILQ_REMOVE(&priv->queue, entry, link);
+					goto free;
+				}
+				if (ENTRY_GET_STATE(entry) == DIRTY) {
+					TAILQ_REMOVE(&priv->queue, entry, link);
+					entry->state = WRITING;
+					entry->update_time = 0;
+					assert(ENTRY_GET_STATE(entry) == WRITING);
+
+					cache_block_num = entry->block_num * multiple;
+					for (i = 0; i < multiple; i++) {
+						memcpy((char *)buf, (char *)entry->buf + i * config->block_size, config->block_size);
+
+						pthread_mutex_unlock(&priv->pri_mutex);
+						r = (*priv->inner->write_block)(priv->inner, cache_block_num, buf, NULL, NULL, NULL);
+
+						pthread_mutex_lock(&priv->pri_mutex);
+						if (r != 0)
+							flag = 1;
+						cache_block_num++;
+					}
+
+					assert(ENTRY_GET_STATE(entry) == WRITING);
+					if (flag) {    // fail
+						entry->state = DIRTY;
+						TAILQ_INSERT_HEAD(&priv->queue, entry, link);
+						continue;
+					}
+					goto free;
+				}
+free:
+				s3b_hash_remove(priv->hashtable, entry->block_num);
+				pthread_cond_signal(&priv->pri_space_avail);
+				pthread_cond_broadcast(&priv->pri_write_complete);
+				free(entry->buf);
+				free(entry->array_min);
+				free(entry);
+				continue;
+			}
+		}
+        /* 退出循环 */
+		if (priv->stopping != 0)
+			break;
+		/* 线程休眠，等待唤醒 */
+    	mem_cache_worker_wait(priv, entry);
+    }
+    /* 减少当前存活线程数目 */
+    priv->num_threads--;
+    (*config->log)(LOG_DEBUG, ".......alive_thread : %u",priv->num_threads);
+    pthread_cond_signal(&priv->pri_worker_exit);
+
+done:
+    pthread_mutex_unlock(&priv->pri_mutex);
+    free(buf);
+    return NULL;
 }
 
 static int
@@ -274,12 +356,26 @@ mem_cache_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, c
 {
     struct mem_cache_private *const priv = s3b->data;
     struct mem_cache_conf *const config = priv->config;
-    (*config->log)(LOG_DEBUG, "mem_write2>>>>>>>> block_num=%u ",block_num);
-    /*struct mem_cache_conf *const config = priv->config;
+    s3b_block_t mem_block_num;
+    size_t fragoff;
+    u_int multiple;
+    u_int cache_bSize = config->block_size;
+    int r;
+
+    pthread_mutex_lock(&priv->pri_mutex);
 
     assert(md5 == NULL);
-    return mem_cache_write(priv, block_num, 0, config->block_size, src);*/
-    return (*priv->inner->write_block)(priv->inner,block_num,src,md5,check_cancel,check_cancel_arg);
+    multiple = config->mem_block_size / cache_bSize;
+	mem_block_num = block_num / multiple;
+	fragoff = (block_num % multiple) * (size_t)cache_bSize;
+	(*config->log)(LOG_DEBUG, "mem_cache_write_block>>>>>>>> mem_block_num=%u fragoff=0x%jx",
+			mem_block_num,(uintmax_t)fragoff);
+
+	//写入长度为block_size数据到大块
+	r = mem_cache_write(priv, mem_block_num, fragoff, cache_bSize, src);
+	pthread_mutex_unlock(&priv->pri_mutex);
+	return r;
+//    return (*priv->inner->write_block)(priv->inner,block_num,src,md5,check_cancel,check_cancel_arg);
 }
 
 static int
@@ -287,73 +383,153 @@ mem_cache_write_block_part(struct s3backer_store *s3b, s3b_block_t block_num, u_
 {
     struct mem_cache_private *const priv = s3b->data;
     struct mem_cache_conf *const config = priv->config;
-    size_t size = len;
     s3b_block_t mem_block_num;
-    const char *buf = src;
-    (*config->log)(LOG_DEBUG, "mem_write1>>>>>>>> block_num=%u off=0x%jx len=0x%jx",block_num,(uintmax_t)off, (uintmax_t)len);
+    size_t fragoff;
+    u_int multiple;
+    u_int cache_bSize = config->block_size;
+    int r;
+//    (*config->log)(LOG_DEBUG, "mem_write1>>>>>>>> block_num=%u off=0x%jx len=0x%jx",block_num,(uintmax_t)off, (uintmax_t)len);
+    pthread_mutex_lock(&priv->pri_mutex);
 
-    const u_int block_bits = ffs(config->block_size) - 1;
-    off_t offsetPer = block_num << block_bits;
-    off_t offset = offsetPer + off;
-    (*config->log)(LOG_DEBUG, "mem_write111>>>>>>>>offset=0x%jx ",(uintmax_t)offset);
+    multiple = config->mem_block_size / cache_bSize;
+    mem_block_num = block_num / multiple;
+    fragoff = (size_t)off + (block_num % multiple) * (size_t)cache_bSize;
+	(*config->log)(LOG_DEBUG, "mem_cache_write_block_part >>>>>>>>>>> mem_block_num=%u fragoff=0x%jx len=0x%jx",
+			mem_block_num,(uintmax_t)fragoff, (uintmax_t)len);
 
-    const u_int mem_block_bits = ffs(config->mem_block_size) - 1;
-    const u_int mask = config->mem_block_size - 1;
-
-    /* Write first block fragment (if any) */
-    if ((offset & mask) != 0) {
-        size_t fragoff = (size_t)(offset & mask);
-        size_t fraglen = (size_t)config->mem_block_size - fragoff;
-        if (fraglen > size)
-            fraglen = size;
-        mem_block_num = offset >> mem_block_bits;
-        //此处写入小块到大块，注：大块非起始位置写入
-        // mem_block_num   fragoff  fraglen   buf
-        (*config->log)(LOG_DEBUG, "mem_write333>>>>>>>> mem_block_num=%u fragoff=0x%jx fraglen=0x%jx",mem_block_num,(uintmax_t)fragoff, (uintmax_t)fraglen);
-
-        buf += fraglen;
-        offset += fraglen;
-        size -= fraglen;
-    }
-
-    mem_block_num = offset >> mem_block_bits;
-    /* Write last block fragment (if any) */
-	if ((size & mask) != 0) {
-		size_t fragoff = 0;
-		const size_t fraglen = size & mask;
-		//此处写入小块到大块，注：大块为起始位置写入
-		// mem_block_num   fragoff  fraglen   buf
-		(*config->log)(LOG_DEBUG, "mem_write444>>>>>>>> mem_block_num=%u fragoff=0x%jx fraglen=0x%jx",mem_block_num,(uintmax_t)fragoff, (uintmax_t)fraglen);
-
-	}
-
-
-
-    return (*priv->inner->write_block_part)(priv->inner,block_num,off,len,src);
-//    return mem_cache_write(priv, block_num, off, len, src);
+	//写入数据到大块
+	r = mem_cache_write(priv, mem_block_num, fragoff, len, src);
+	pthread_mutex_unlock(&priv->pri_mutex);
+	return r;
+//    return (*priv->inner->write_block_part)(priv->inner,block_num,off,len,src);
 }
 
 /*
- * Write a block
+ * Write a memory block
  */
-/*static int
+static int
 mem_cache_write(struct mem_cache_private *const priv, s3b_block_t block_num, u_int off, u_int len, const void *src)
 {
     struct mem_cache_conf *const config = priv->config;
     struct mem_entry *entry;
+    struct min_block *min_entry;
+    int flag=0;
+    int r;
+    int i;
+    u_int min_entry_num;
+    u_int min_bNum_begin;
+    u_int min_bNum_end;
+    min_entry_num = ceil((double)config->mem_block_size / config->min_block_size);
+    min_bNum_begin = floor((double)off / config->min_block_size);
+    min_bNum_end = ceil((double)(off + len) / config->min_block_size);
 
-    (*config->log)(LOG_DEBUG, "mem_cache_write>>>>>>>> %u >>>>offset=0x%jx size=0x%jx",block_num,(uintmax_t)off, (uintmax_t)len);
+    /* Sanity check */
+    assert(off <= config->mem_block_size);
+    assert(len <= config->mem_block_size);
+    assert(off + len <= config->mem_block_size);
+again:
+    /* Find mem_entry */
+    if ((entry = s3b_hash_get(priv->hashtable, block_num)) != NULL) {
+        assert(entry->block_num == block_num);
+		switch (ENTRY_GET_STATE(entry)) {
+		case READING:               /* wait for entry to leave READING */
+			pthread_cond_wait(&priv->pri_end_reading, &priv->pri_mutex);
+			goto again;
+		case WRITING:               /* wait for entry to leave WRITING */
+			pthread_cond_wait(&priv->pri_write_complete, &priv->pri_mutex);
+			goto again;
+		case CLEAN:
+			/* If there are too many dirty blocks, we have to wait */
+			if (entry->num_dirties >= config->min_max_dirty) {
+				pthread_cond_signal(&priv->pri_worker_work);
+				pthread_cond_wait(&priv->pri_write_complete, &priv->pri_mutex);
+				goto again;
+			}
+			flag = 1;
+			// FALLTHROUGH
+		case DIRTY:
+			for (i = 0; i < (min_bNum_end - min_bNum_begin); i++) {
+				min_entry = entry->array_min[min_bNum_begin + i];
+//				pthread_mutex_lock(&min_entry->min_mutex);
+			}
+			if ((r = get_mem_cache_data(priv, entry, src, off, len)) != 0) {
+				(*config->log)(LOG_ERR, "error writing mem_cache block! %s", strerror(r));
+				return r;
+			}
+		    if (entry == NULL) {
+		        pthread_cond_wait(&priv->pri_space_avail, &priv->pri_mutex);
+		        goto again;
+		    }
+//			for (i = 0; i < (min_bNum_end - min_bNum_begin); i++) {
+//				pthread_mutex_unlock(&min_entry->min_mutex);
+//			}
+
+//			pthread_mutex_lock(&entry->mem_mutex);
+			entry->update_time = mem_cache_get_time_millis();
+			if (flag) {    //clean
+				for (i = 0; i < (min_bNum_end - min_bNum_begin); i++) {
+					min_entry = entry->array_min[min_bNum_begin + i];
+					min_entry->state = DIRTY;
+				}
+				entry->state = DIRTY;
+				entry->num_dirties += min_bNum_end - min_bNum_begin;
+			} else {       //dirty
+				if (ENTRY_GET_STATE(min_entry) != DIRTY) {
+					for (i = 0; i < (min_bNum_end - min_bNum_begin); i++) {
+						min_entry = entry->array_min[min_bNum_begin + i];
+						min_entry->state = DIRTY;
+					}
+					entry->num_dirties += min_bNum_end - min_bNum_begin;
+				}
+			}
+//			pthread_mutex_unlock(&entry->mem_mutex);
+			break;
+		default:
+			assert(0);
+			break;
+		}
+		goto done;
+    }
+	/* 新建mem_entry及数据buffer */
+	if ((r = mem_cache_get_entry(priv, &entry)) != 0) {
+		pthread_cond_wait(&priv->pri_space_avail, &priv->pri_mutex);
+		goto again;
+	}
+    //从磁盘缓存读取数据到mem_entry
+    if ((r = mem_cache_read_inner(priv,block_num,entry)) != 0)
+    	(*config->log)(LOG_ERR, "error read mem_entry from cache_entry! %s", strerror(r));
+    goto again;
+done:
+	pthread_cond_signal(&priv->pri_worker_work);
     return 0;
-}*/
+}
 
 static int
 mem_cache_read_block_part(struct s3backer_store *s3b, s3b_block_t block_num, u_int off, u_int len, void *dest)
 {
     struct mem_cache_private *const priv = s3b->data;
     struct mem_cache_conf *const config = priv->config;
-    (*config->log)(LOG_DEBUG, "mem_read1>>>>>>>>block_num=%u offset=0x%jx len=0x%jx ",block_num,(uintmax_t)off, (uintmax_t)len);
-//    return mem_cache_read(priv, block_num, off, len, dest);
-    return (*priv->inner->read_block_part)(priv->inner,block_num,off,len,dest);
+    s3b_block_t mem_block_num;
+    size_t fragoff;
+    u_int multiple;
+    int r;
+//	(*config->log)(LOG_DEBUG, "mem_read000>>>>>>>> block_num=%u fragoff=0x%jx fraglen=0x%jx", block_num,(uintmax_t)off, (uintmax_t)len);
+
+    /* Grab lock */
+	pthread_mutex_lock(&priv->pri_mutex);
+
+    multiple = config->mem_block_size / config->block_size;
+    mem_block_num = block_num / multiple;
+    fragoff = (size_t)off + (block_num % multiple) * (size_t)config->block_size;
+	(*config->log)(LOG_DEBUG, "mem_cache_read_block_part >>>>>>>>>>> mem_block_num=%u fragoff=0x%jx len=0x%jx",
+			mem_block_num,(uintmax_t)fragoff, (uintmax_t)len);
+	//从大块读取小块到dest，注：读取长度小于磁盘缓存块大小
+	r = mem_cache_read(priv, mem_block_num, fragoff, len, dest);
+
+	/* Release lock */
+	pthread_mutex_unlock(&priv->pri_mutex);
+	return r;
+//    return (*priv->inner->read_block_part)(priv->inner,block_num,off,len,dest);
 }
 
 static int
@@ -362,15 +538,29 @@ mem_cache_read_block(struct s3backer_store *const s3b, s3b_block_t block_num, vo
 {
     struct mem_cache_private *const priv = s3b->data;
     struct mem_cache_conf *const config = priv->config;
-	(*config->log)(LOG_DEBUG, "mem_read2>>>>>>>>block_num=%u",block_num);
-//    struct mem_cache_conf *const config = priv->config;
-//    (*config->log)(LOG_DEBUG, "mem_cache_read_block>>>>>>>> %u",block_num);
-//	(*config->log)(LOG_DEBUG, "333>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
-//    struct mem_cache_conf *const config = priv->config;
-    return (*priv->inner->read_block)(priv->inner,block_num,dest,actual_md5,expect_md5,strict);
-//    assert(expect_md5 == NULL);
-//    assert(actual_md5 == NULL);
-//    return mem_cache_read(priv, block_num, 0, config->block_size, dest);
+    s3b_block_t mem_block_num;
+    size_t fragoff;
+    u_int multiple;
+    int r;
+
+    assert(expect_md5 == NULL);
+    assert(actual_md5 == NULL);
+
+    /* Grab lock */
+	pthread_mutex_lock(&priv->pri_mutex);
+
+	multiple = config->mem_block_size / config->block_size;
+    mem_block_num = block_num / multiple;
+    fragoff = (block_num % multiple) * (size_t)config->block_size;
+	(*config->log)(LOG_DEBUG, "mem_cache_read_block >>>>>>>>>>> mem_block_num=%u fragoff=0x%jx",
+			mem_block_num,(uintmax_t)fragoff);
+	//从大块读取小块到dest，注：读取长度为磁盘缓存块大小
+	r = mem_cache_read(priv, mem_block_num, fragoff, config->block_size, dest);
+
+	/* Release lock */
+	pthread_mutex_unlock(&priv->pri_mutex);
+	return r;
+//    return (*priv->inner->read_block)(priv->inner,block_num,dest,actual_md5,expect_md5,strict);
 }
 
 /*
@@ -378,15 +568,164 @@ mem_cache_read_block(struct s3backer_store *const s3b, s3b_block_t block_num, vo
  *
  * Assumes the mutex is held.
  */
-/*static int
+static int
 mem_cache_read(struct mem_cache_private *const priv, s3b_block_t block_num, u_int off, u_int len, void *dest)
 {
 	struct mem_cache_conf *const config = priv->config;
 	struct mem_entry *entry;
-	(*config->log)(LOG_DEBUG, "mem_cache_do_read>>>>>>>> %u >>>>offset=0x%jx size=0x%jx",block_num,(uintmax_t)off, (uintmax_t)len);
-	(*config->log)(LOG_DEBUG, ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+	int r;
+	/* Sanity check */
+	assert(off <= config->mem_block_size);
+	assert(len <= config->mem_block_size);
+	assert(off + len <= config->mem_block_size);
+
+again:
+	/* a mem_entry already exists */
+	if ((entry = s3b_hash_get(priv->hashtable, block_num)) != NULL) {
+		assert(entry->block_num == block_num);
+		switch (ENTRY_GET_STATE(entry)) {
+		case READING:       /* Wait for other thread already reading this block to finish */
+			pthread_cond_wait(&priv->pri_end_reading, &priv->pri_mutex);
+			goto again;
+		case CLEAN:
+		case DIRTY:
+		case WRITING:
+			memcpy((char *)dest, (char *)entry->buf + off, len);
+//			pthread_mutex_lock(&entry->mem_mutex);
+			entry->update_time = mem_cache_get_time_millis();
+//			pthread_mutex_unlock(&entry->mem_mutex);
+			break;
+		default:
+			assert(0);
+			break;
+		}
+		return 0;
+	}
+	/* 新建mem_entry及数据buffer */
+	if ((r = mem_cache_get_entry(priv, &entry)) != 0) {
+		pthread_cond_wait(&priv->pri_space_avail, &priv->pri_mutex);
+		goto again;
+	}
+	if ((r = mem_cache_read_inner(priv,block_num,entry)) != 0) {
+		(*config->log)(LOG_ERR, "error read mem_entry from cache_entry! %s", strerror(r));
+		return r;
+	}
+	goto again;
+}
+
+/*
+ * 从下一层读取memory cache block数据并加入队列
+ */
+static int
+mem_cache_read_inner(struct mem_cache_private *const priv, s3b_block_t mem_block_num, struct mem_entry *entry)
+{
+	struct mem_cache_conf *const config = priv->config;
+	const u_int block_bits = ffs(config->block_size) - 1;
+	char *buf;
+	u_int num_blocks = config->mem_block_size >> block_bits;
+	u_int min_nums;
+	u_int offs = 0;
+	int i;
+	int r;
+
+	/* 初始化mem_entry, 状态:reading */
+//	pthread_mutex_lock(&priv->pri_mutex);
+	entry->block_num = mem_block_num;
+	entry->state = READING;
+	ENTRY_RESET_LINK(entry);
+	s3b_hash_put_new(priv->hashtable, entry);
+	TAILQ_INSERT_TAIL(&priv->queue, entry, link);
+//	pthread_mutex_unlock(&priv->pri_mutex);
+	assert(ENTRY_GET_STATE(entry) == READING);
+
+	/* 计算磁盘缓存层block_num */
+	s3b_block_t cache_block_num = mem_block_num * num_blocks;
+
+	/* 从磁盘缓存层读取数据,并写入mem_entry(可能包含多个cache_entry)*/
+    while (num_blocks-- > 0) {
+    	if ((buf = malloc(config->block_size)) == NULL) {
+    		r = errno;
+			(*config->log)(LOG_ERR, "can't allocate block cache buffer: %s", strerror(r));
+			return r;
+    	}
+    	pthread_mutex_unlock(&priv->pri_mutex);
+        r = (*priv->inner->read_block)(priv->inner, cache_block_num, buf, NULL, NULL, 0);
+        pthread_mutex_lock(&priv->pri_mutex);
+        /* 写入buf到mem_entry中数据buffer */
+        if ((r = get_mem_cache_data(priv, entry, buf, offs, config->block_size)) != 0)
+			(*config->log)(LOG_ERR, "error updating mem_cache block! %s", strerror(r));
+        offs += config->block_size;
+        cache_block_num++;
+//        (*config->log)(LOG_DEBUG, ">>>>>>>>>>>>>>> buf=%s", buf);
+        free(buf);
+    }
+
+    assert(s3b_hash_get(priv->hashtable, mem_block_num) == entry);
+	assert(ENTRY_GET_STATE(entry) == READING);
+	pthread_cond_broadcast(&priv->pri_end_reading);
+	pthread_cond_signal(&priv->pri_space_avail);
+    /* 更新min_entry，状态为clean, 注：偏移量为相对的*/
+//    pthread_mutex_lock(&entry->mem_mutex);
+    entry->state = CLEAN;
+    min_nums = ceil((double)config->mem_block_size / config->min_block_size);
+    for (i = 0; i < min_nums; i++) {
+    	(*entry->array_min[i]).offset = i * config->min_block_size;
+    	(*entry->array_min[i]).size = config->min_block_size;
+    	(*entry->array_min[i]).state = CLEAN;
+    }
+	entry->update_time = mem_cache_get_time_millis();
+//	pthread_mutex_unlock(&entry->mem_mutex);
 	return 0;
-}*/
+}
+
+static int
+mem_cache_get_entry(struct mem_cache_private *priv, struct mem_entry **entryp)
+{
+    struct mem_cache_conf *const config = priv->config;
+    struct mem_entry *entry;
+    struct min_block *min_entry;
+    void *data = NULL;
+    u_int min_entry_size;
+    u_int hash_length;
+    u_int multiple;
+    int r;
+
+    multiple = config->mem_block_size / config->block_size;
+    hash_length = ceil((double)config->cache_size / multiple);
+	min_entry_size = ceil((double)config->mem_block_size / config->min_block_size);
+
+	if (s3b_hash_size(priv->hashtable) < hash_length) {
+        if ((entry = calloc(1, sizeof(*entry))) == NULL) {
+            r = errno;
+            (*config->log)(LOG_ERR, "can't allocate mem_entry memory entry: %s", strerror(r));
+            return r;
+        }
+    } else
+        goto done;
+
+    /* Get data buffer */
+	if ((data = malloc(config->mem_block_size)) == NULL) {
+		r = errno;
+		(*config->log)(LOG_ERR, "can't allocate data memory buffer: %s", strerror(r));
+		free(entry);
+		return r;
+	}
+	entry->buf = data;
+
+	void *dd = NULL;
+	if ((dd = malloc(sizeof(*min_entry) * min_entry_size)) == NULL) {
+		r = errno;
+		(*config->log)(LOG_ERR, "can't allocate min_entry memory buffer: %s", strerror(r));
+		free(entry);
+		free(data);
+		return r;
+	}
+	entry->array_min = dd;
+
+done:
+    *entryp = entry;
+    return 0;
+}
 
 static int
 mem_cache_meta_data(struct s3backer_store *s3b, off_t *file_sizep, u_int *block_sizep)
@@ -408,7 +747,7 @@ static int
 mem_cache_flush(struct s3backer_store *const s3b)
 {
     struct mem_cache_private *const priv = s3b->data;
-
+    struct mem_cache_conf *const config = priv->config;
     /* Grab lock and sanity check */
     pthread_mutex_lock(&priv->pri_mutex);
     S3BCACHE_CHECK_INVARIANTS(priv);
@@ -416,8 +755,9 @@ mem_cache_flush(struct s3backer_store *const s3b)
     /* Wait for all blocks to timeout or all worker threads to exit */
     priv->stopping = 1;
     while (TAILQ_FIRST(&priv->queue) != NULL || priv->num_threads > 0) {
-        pthread_cond_broadcast(&priv->worker_work);
-        pthread_cond_wait(&priv->worker_exit, &priv->pri_mutex);
+        pthread_cond_broadcast(&priv->pri_worker_work);
+        pthread_cond_wait(&priv->pri_worker_exit, &priv->pri_mutex);
+        (*config->log)(LOG_ERR, ">>>mem_cache_flush----");
     }
 
     /* Release lock */
@@ -438,8 +778,9 @@ mem_cache_destroy(struct s3backer_store *const s3b)
     /* Wait for all blocks to timeout or all worker threads to exit */
     priv->stopping = 1;
     while (TAILQ_FIRST(&priv->queue) != NULL || priv->num_threads > 0) {
-        pthread_cond_broadcast(&priv->worker_work);
-        pthread_cond_wait(&priv->worker_exit, &priv->pri_mutex);
+        pthread_cond_broadcast(&priv->pri_worker_work);
+        pthread_cond_wait(&priv->pri_worker_exit, &priv->pri_mutex);
+        (*config->log)(LOG_ERR, ">>>mem_cache_destroy----");
     }
 
     /* Destroy inner store */
@@ -448,11 +789,11 @@ mem_cache_destroy(struct s3backer_store *const s3b)
     /* Free structures */
     s3b_hash_foreach(priv->hashtable, mem_cache_free_one, priv);
     s3b_hash_destroy(priv->hashtable);
-    pthread_cond_destroy(&priv->write_complete);
-    pthread_cond_destroy(&priv->worker_exit);
-    pthread_cond_destroy(&priv->worker_work);
-    pthread_cond_destroy(&priv->end_reading);
-    pthread_cond_destroy(&priv->space_avail);
+	pthread_cond_destroy(&priv->pri_space_avail);
+    pthread_cond_destroy(&priv->pri_end_reading);
+    pthread_cond_destroy(&priv->pri_write_complete);
+    pthread_cond_destroy(&priv->pri_worker_exit);
+    pthread_cond_destroy(&priv->pri_worker_work);
     pthread_mutex_destroy(&priv->pri_mutex);
     free(priv);
     free(s3b);
@@ -475,6 +816,72 @@ mem_cache_list_blocks(struct s3backer_store *s3b, block_list_func_t *callback, v
     return 0;*/
 }
 
+/*
+ * Write the data to a buffer.
+ */
+static int
+get_mem_cache_data(struct mem_cache_private *priv, struct mem_entry *entry, const void *src, u_int off, u_int len)
+{
+    struct mem_cache_conf *const config = priv->config;
+    /* Sanity check */
+    assert(off <= config->mem_block_size);
+    assert(len <= config->mem_block_size);
+    assert(off + len <= config->mem_block_size);
+    if (src == NULL)    //删除文件时，由fuse_op_fallocate触发
+		memset((char *)entry->buf + off, 0, len);
+	else
+		memcpy((char *)entry->buf + off, (char *)src, len);
+	return 0;
+}
+
+/*
+ * 当队列为空或者超时，线程进入休眠状态
+ * 注：超时计算时，单位换算为uint64_t
+ * 注：配合互斥锁使用
+ */
+static void
+mem_cache_worker_wait(struct mem_cache_private *priv, struct mem_entry *entry)
+{
+	struct mem_cache_conf *const config = priv->config;
+    uint64_t wake_time_millis;
+    struct timespec wake_time;
+
+    if (entry == NULL) {
+        pthread_cond_wait(&priv->pri_worker_work, &priv->pri_mutex);
+        return;
+    }
+    wake_time_millis = ((uint64_t)config->mem_timeout) * TIME_UNIT_MILLIS + entry->update_time;
+    wake_time.tv_sec = wake_time_millis / 1000;
+    wake_time.tv_nsec = (wake_time_millis % 1000) * 1000000;
+    pthread_cond_timedwait(&priv->pri_worker_work, &priv->pri_mutex, &wake_time);
+}
+
+/*
+ * Return current time in units of TIME_UNIT_MILLIS milliseconds since startup.
+ */
+static uint32_t
+mem_cache_get_time(struct mem_cache_private *priv)
+{
+    uint64_t timer;
+
+    timer = mem_cache_get_time_millis();
+    return (uint32_t)(timer / TIME_UNIT_MILLIS);
+}
+
+/*
+ * Return current time in milliseconds.
+ */
+static uint64_t
+mem_cache_get_time_millis(void)
+{
+//	uint64_t since_start;
+    struct timeval tv;
+
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+//    return (uint32_t)(since_start / TIME_UNIT_MILLIS);
+}
+
 static void
 mem_cache_free_one(void *arg, void *value)
 {
@@ -485,3 +892,18 @@ mem_cache_free_one(void *arg, void *value)
     free(entry->buf);
     free(entry);
 }
+
+/*
+ * 计算脏块占比
+ */
+static double
+mem_cache_dirty_ratio(struct mem_cache_private *priv, struct mem_entry *entry)
+{
+    struct mem_cache_conf *const config = priv->config;
+    u_int min_entry_size;
+	min_entry_size = ceil((double)config->mem_block_size / config->min_block_size);
+
+    return (double)entry->num_dirties / (double)min_entry_size;
+}
+
+

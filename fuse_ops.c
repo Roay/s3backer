@@ -398,7 +398,6 @@ fuse_op_read(const char *path, char *buf, size_t size, off_t offset,
         size = priv->file_size - offset;
         orig_size = size;
     }
-    (*config->log)(LOG_DEBUG, "read>>>>>>>>>>>>>>> offset=0x%jx size=0x%jx", (uintmax_t)offset, (uintmax_t)size);
     /* Read first block fragment (if any) */
     if ((offset & mask) != 0) {
         size_t fragoff = (size_t)(offset & mask);
@@ -433,6 +432,7 @@ fuse_op_read(const char *path, char *buf, size_t size, off_t offset,
             return -r;
     }
 
+    (*config->log)(LOG_DEBUG, "read>>>>>>>>>>>>>>> offset=0x%jx size=0x%jx buf=%s", (uintmax_t)offset, (uintmax_t)size, buf);
     /* Done */
     priv->file_atime = time(NULL);
     return orig_size;
@@ -469,7 +469,7 @@ static int fuse_op_write(const char *path, const char *buf, size_t size,
     /* Handle request to write nothing */
     if (size == 0)
         return 0;
-    (*config->log)(LOG_DEBUG, "write>>>>>>>>>>>>>>> offset=0x%jx size=0x%jx", (uintmax_t)offset, (uintmax_t)size);
+    (*config->log)(LOG_DEBUG, "fuse_op_write>>>>>>>>>>>>>>> offset=0x%jx size=0x%jx", (uintmax_t)offset, (uintmax_t)size);
     /* Write first block fragment (if any) */
     if ((offset & mask) != 0) {
         size_t fragoff = (size_t)(offset & mask);
@@ -574,6 +574,7 @@ fuse_op_fallocate(const char *path, int mode, off_t offset, off_t len, struct fu
     if ((zero_block = calloc(1, config->block_size)) == NULL)
         return -ENOMEM;
 
+    (*config->log)(LOG_DEBUG, "fuse_op_fallocate>>>>>>>>>>>>>>> offset=0x%jx size=0x%jx", (uintmax_t)offset, (uintmax_t)size);
     /* Write first block fragment (if any) */
     if ((offset & mask) != 0) {
         size_t fragoff = (size_t)(offset & mask);

@@ -1667,8 +1667,8 @@ dump_config(void)
     (*config.log)(LOG_DEBUG, "%24s: %s", "block_cache_no_verify", config.block_cache.no_verify ? "true" : "false");
     (*config.log)(LOG_DEBUG, "%24s: %s", "mem_cache_flag", config.mem_cache_flag ? "true" : "false");
     (*config.log)(LOG_DEBUG, "%24s: %s (%u)", "mem_block_size",
-      config.mem_block_size_str != NULL ? config.mem_block_size_str : "-", (intmax_t)config.mem_cache.mem_block_size);
-    (*config.log)(LOG_DEBUG, "%24s: %s (%jd)", "min_block_size",
+      config.mem_block_size_str != NULL ? config.mem_block_size_str : "-", config.mem_cache.mem_block_size);
+    (*config.log)(LOG_DEBUG, "%24s: %s (%u)", "min_block_size",
       config.min_block_size_str != NULL ? config.min_block_size_str : "-", config.mem_cache.min_block_size);
     (*config.log)(LOG_DEBUG, "%24s: %u threads", "mem_max_threads", config.mem_cache.mem_max_threads);
     (*config.log)(LOG_DEBUG, "%24s: %u blocks", "min_max_dirty", config.mem_cache.min_max_dirty);

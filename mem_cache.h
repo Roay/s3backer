@@ -43,7 +43,7 @@ struct mem_cache_conf {
     u_int               mem_block_size;   // mem_block size
     u_int               min_num_blocks;   // number of min_blocks
     u_int               mem_max_threads;
-    u_int               mem_timeout;
+    uint32_t            mem_timeout;
     log_func_t          *log;
 };
 
